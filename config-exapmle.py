@@ -6,6 +6,7 @@ class Config:
     rtsp_port = 4554       # Client listener port
     start_udp_port = 5550
     local_ip = socket.gethostbyname(socket.gethostname())
+    rtp_buffer_size = 256  # Number of RTP packets stored per track
 
     # Camera(s) settings.
     #    * The keys of this dictionary will be called "camera hash".
@@ -24,6 +25,11 @@ class Config:
             'path': 'some folder in the storage_path',
             'url': 'rtsp://[<login>:<password>@]<IP or host name>[:554][/<uri>]',
             # 'storage_command': 'any *nix command for saving rtsp stream to a file',
+        },
+        # The "source" field allows registering multiple RTSP paths that share the same camera stream.
+        # Each alias must reference the key of a camera that defines the "url" field.
+        'cam-alias-example': {
+            'source': 'some-URL-compatible-string/including-UTF-characters',
         },
     }
 
