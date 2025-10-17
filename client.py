@@ -4,8 +4,10 @@ import string
 import time
 from random import choices, randrange
 from urllib.parse import unquote
+from typing import List, Optional
+
 from _config import Config
-from shared import Shared
+from shared import Shared, CameraState
 from camera import Camera
 from log import Log
 
@@ -19,6 +21,9 @@ class Client:
         self.tcp_port = peername[1]
         self.camera_hash, self.session_id = None, None
         self.udp_ports = {}
+        self._camera_state: Optional[CameraState] = None
+        self._stream_tasks: List[asyncio.Task] = []
+        self._stream_started = False
 
     @staticmethod
     async def listen():
@@ -61,9 +66,14 @@ class Client:
 
         elif option == 'PLAY':
             # Now we are ready to share this instance
-            Shared.data[self.camera_hash]['clients'][self.session_id] = self
+            state = self._camera_state
+            if not state:
+                raise RuntimeError('camera state is not initialised')
+            state.clients[self.session_id] = self
 
-            camera = Shared.data[self.camera_hash]['camera']
+            camera = state.camera
+            if not camera:
+                raise RuntimeError('camera is not initialised')
 
             # Start camera's playing before client's playing because we need to get RTP info first
             await camera.play()
@@ -79,6 +89,8 @@ class Client:
 
             info = f'Client: play [{self.camera_hash}] [{self.session_id}] [{self.host}] {self.user_agent}'
             Log.write(info, self.host)
+
+            await self._start_stream(camera)
 
             # In TCP mode we'll stop listening rtsp
             if Config.tcp_mode:
@@ -96,15 +108,23 @@ class Client:
     async def close(self):
         if not self.camera_hash:
             return
-        clients = Shared.data[self.camera_hash]['clients']
+        await self._stop_stream()
+
+        if self.writer:
+            try:
+                if not self.writer.transport.is_closing():
+                    self.writer.close()
+                    await self.writer.wait_closed()
+            except (Exception,):
+                pass
+
+        state = self._camera_state or Shared.data.get(self.camera_hash)
+        if not state:
+            return
+
+        clients = state.clients
         if not self.session_id or self.session_id not in clients:
             return
-        try:
-            if not self.writer.transport.is_closing():
-                self.writer.close()
-                await self.writer.wait_closed()
-        except (Exception,):
-            pass
 
         del clients[self.session_id]
 
@@ -113,15 +133,19 @@ class Client:
         # If last client is closed, close the camera connection too
         if not clients:
             try:
-                await Shared.data[self.camera_hash]['camera'].close()
+                if state.camera:
+                    await state.camera.close()
             except Exception as e:
                 Log.print(f"Client: error: can't close the camera {self.camera_hash}: {e}")
-            Shared.data[self.camera_hash]['camera'] = None
+            state.camera = None
 
     def _get_rtp_info(self):
         """ Build new "RTP-Info" line (for UDP mode only)
         """
-        camera = Shared.data[self.camera_hash]['camera']
+        if not self._camera_state or not self._camera_state.camera:
+            return
+
+        camera = self._camera_state.camera
         rtp_info = camera.rtp_info
         if not rtp_info:
             return
@@ -161,17 +185,18 @@ class Client:
 
         if not self.camera_hash:
             camera_hash = unquote(res.group(2))
-            if camera_hash not in Config.cameras:
+            if camera_hash not in Shared.data:
                 raise RuntimeError('invalid camera hash')
 
             self.camera_hash = camera_hash
+            self._camera_state = Shared.data[camera_hash]
 
-            # Create the camera connection if not exists
-            if not Shared.data[camera_hash]['camera']:
-                camera = Camera(camera_hash)
+            if not self._camera_state.camera:
+                camera = Camera(self._camera_state.source)
                 await camera.connect()
-
-                Shared.data[camera_hash]['camera'] = camera
+                if not camera.session_id:
+                    raise RuntimeError(f'camera "{camera_hash}" is unavailable')
+                self._camera_state.camera = camera
 
         return option
 
@@ -189,6 +214,76 @@ class Client:
         self.writer.write(reply.encode())
 
         Log.print(f'~~~ Client: write\n{reply}')
+
+    async def _start_stream(self, camera: Camera):
+        if self._stream_started:
+            return
+
+        self._stream_started = True
+
+        if Config.tcp_mode:
+            task = asyncio.create_task(self._stream_tcp(camera))
+            self._stream_tasks.append(task)
+            return
+
+        tracks = [idx for idx in camera.get_tracks() if idx in self.udp_ports]
+        for idx in tracks:
+            task = asyncio.create_task(self._stream_udp(camera, idx))
+            self._stream_tasks.append(task)
+
+    async def _stop_stream(self):
+        if not self._stream_tasks:
+            self._stream_started = False
+            return
+
+        for task in list(self._stream_tasks):
+            task.cancel()
+
+        for task in list(self._stream_tasks):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                Log.print(f'Client: stream task error [{self.camera_hash}]: {e}')
+
+        self._stream_tasks.clear()
+        self._stream_started = False
+
+    async def _stream_tcp(self, camera: Camera):
+        reader = await camera.create_reader('tcp')
+        try:
+            while True:
+                packet = await reader.read()
+                if packet is None:
+                    break
+                if self.writer.transport.is_closing():
+                    break
+                self.writer.write(packet)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            Log.print(f'Client: tcp stream error [{self.camera_hash}]: {e}')
+        finally:
+            await reader.close()
+
+    async def _stream_udp(self, camera: Camera, track_idx: int):
+        reader = await camera.create_reader(track_idx)
+        try:
+            while True:
+                packet = await reader.read()
+                if packet is None:
+                    break
+                if track_idx not in self.udp_ports:
+                    break
+                udp_port = self.udp_ports[track_idx][0]
+                camera.send_udp(track_idx, packet, self.host, udp_port)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            Log.print(f'Client: udp stream error [{self.camera_hash}]: {e}')
+        finally:
+            await reader.close()
 
     def _get_transport_line(self, ask):
         """ Search "interleaved" channels for TCP mode or client ports for UDP one
@@ -208,7 +303,10 @@ class Client:
     def _get_description(self):
         """ Create new SDP based on original one from the camera
         """
-        sdp = Shared.data[self.camera_hash]['camera'].description
+        if not self._camera_state or not self._camera_state.camera:
+            raise RuntimeError('camera is not initialised')
+
+        sdp = self._camera_state.camera.description
         res = 'v=0\r\n' \
             f'o=- {randrange(100000, 999999)} {randrange(1, 10)} IN IP4 {Config.local_ip}\r\n' \
             's=python-rtsp-server\r\n' \
@@ -237,7 +335,10 @@ class Client:
         if not Config.web_limit or _get_client_type(self.host) == 'local':
             return
         web_sessions = []
-        clients = Shared.data[self.camera_hash]['clients']
+        state = self._camera_state or Shared.data.get(self.camera_hash)
+        if not state:
+            return
+        clients = state.clients
         for session_id, client in clients.items():
             if _get_client_type(client.host) == 'web':
                 web_sessions.append(session_id)
