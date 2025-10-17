@@ -26,10 +26,20 @@ class Config:
             'url': 'rtsp://[<login>:<password>@]<IP or host name>[:554][/<uri>]',
             # 'storage_command': 'any *nix command for saving rtsp stream to a file',
         },
-        # The "source" field allows registering multiple RTSP paths that share the same camera stream.
-        # Each alias must reference the key of a camera that defines the "url" field.
+        # The "source" field allows registering multiple RTSP paths that share the same
+        # camera stream. Each alias must reference the key of a camera that defines the
+        # "url" field.
         'cam-alias-example': {
             'source': 'some-URL-compatible-string/including-UTF-characters',
+        },
+        # Example: expose the same physical camera through two RTSP URLs ("cam1" and
+        # "front-door"). Clients can connect to either path and will receive packets
+        # from the single shared camera connection.
+        'cam1': {
+            'url': 'rtsp://admin:admin@192.168.1.1:554',
+        },
+        'front-door': {
+            'source': 'cam1',
         },
     }
 

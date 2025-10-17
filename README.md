@@ -42,6 +42,28 @@ TCP mode:
 vlc --rtsp-tcp rtsp://localhost:4554/camera-hash
 ```
 
+### Expose one camera under multiple RTSP paths
+
+To publish the same physical camera via several URLs, register aliases in
+`_config.py`. The primary entry must contain the camera `url`, while each alias
+specifies a `source` pointing to that primary key:
+
+```python
+class Config:
+    cameras = {
+        'cam1': {
+            'url': 'rtsp://admin:admin@192.168.1.1:554',
+        },
+        'front-door': {
+            'source': 'cam1',
+        },
+    }
+```
+
+Clients can then connect to either `rtsp://<server>:4554/cam1` or
+`rtsp://<server>:4554/front-door`; both URLs deliver packets from the same
+shared camera connection.
+
 ### Start on boot with systemd
 
 Create the service unit /etc/systemd/system/python-rtsp-server.service:
