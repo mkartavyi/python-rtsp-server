@@ -188,6 +188,19 @@ class Client:
         parsed_uri = urlparse(uri)
         if parsed_uri.scheme not in {'rtsp', 'rtsps'}:
             raise RuntimeError('invalid ask')
+        option, uri = parts[0], parts[1]
+
+        parsed_uri = urlparse(uri)
+        if parsed_uri.scheme not in {'rtsp', 'rtsps'}:
+            raise RuntimeError('invalid ask')
+
+        camera_path = parsed_uri.path.lstrip('/')
+        if parsed_uri.params:
+            camera_path = f'{camera_path};{parsed_uri.params}' if camera_path else parsed_uri.params
+        if parsed_uri.query:
+            camera_path = f'{camera_path}?{parsed_uri.query}' if camera_path else parsed_uri.query
+        if parsed_uri.fragment:
+            camera_path = f'{camera_path}#{parsed_uri.fragment}' if camera_path else parsed_uri.fragment
 
         camera_path = parsed_uri.path.lstrip('/')
         if parsed_uri.params:
@@ -410,6 +423,9 @@ class Client:
 
         for param in self._format_server_ports(track_idx):
             response_params.append(param)
+        server_ports = self._format_server_ports(track_idx)
+        if server_ports:
+            response_params.append(server_ports)
 
         self._transport_protocol = 'udp'
         return f'Transport: {";".join([protocol_token] + response_params)}'
