@@ -4,7 +4,6 @@ import string
 import time
 from random import choices, randrange
 from urllib.parse import unquote, urlparse
-
 from typing import Dict, List, Optional
 
 from _config import Config
@@ -189,6 +188,19 @@ class Client:
         parsed_uri = urlparse(uri)
         if parsed_uri.scheme not in {'rtsp', 'rtsps'}:
             raise RuntimeError('invalid ask')
+        option, uri = parts[0], parts[1]
+
+        parsed_uri = urlparse(uri)
+        if parsed_uri.scheme not in {'rtsp', 'rtsps'}:
+            raise RuntimeError('invalid ask')
+
+        camera_path = parsed_uri.path.lstrip('/')
+        if parsed_uri.params:
+            camera_path = f'{camera_path};{parsed_uri.params}' if camera_path else parsed_uri.params
+        if parsed_uri.query:
+            camera_path = f'{camera_path}?{parsed_uri.query}' if camera_path else parsed_uri.query
+        if parsed_uri.fragment:
+            camera_path = f'{camera_path}#{parsed_uri.fragment}' if camera_path else parsed_uri.fragment
 
         camera_path = parsed_uri.path.lstrip('/')
         if parsed_uri.params:
@@ -409,6 +421,8 @@ class Client:
         if not has_client_port:
             raise RuntimeError('invalid transport ports')
 
+        for param in self._format_server_ports(track_idx):
+            response_params.append(param)
         server_ports = self._format_server_ports(track_idx)
         if server_ports:
             response_params.append(server_ports)
@@ -537,15 +551,33 @@ class Client:
 
         return None
 
-    def _format_server_ports(self, track_idx: int) -> Optional[str]:
+    def _format_server_ports(self, track_idx: int) -> List[str]:
+        params: List[str] = []
         camera = self._camera_state.camera if self._camera_state else None
+
+        server_port: Optional[str] = None
         if camera and 0 <= track_idx < len(camera.udp_ports):
             ports = camera.udp_ports[track_idx]
             if len(ports) >= 2:
-                return f'server_port={ports[0]}-{ports[1]}'
+                server_port = f'server_port={ports[0]}-{ports[1]}'
 
-        base_port = Config.start_udp_port + track_idx * 2
-        return f'server_port={base_port}-{base_port + 1}'
+        if not server_port:
+            base_port = Config.start_udp_port + track_idx * 2
+            server_port = f'server_port={base_port}-{base_port + 1}'
+
+        params.append(server_port)
+
+        if camera:
+            extras = camera.get_transport_params(track_idx)
+            if extras:
+                ssrc = extras.get('ssrc')
+                if ssrc:
+                    params.append(f'ssrc={ssrc}')
+                mode = extras.get('mode')
+                if mode:
+                    params.append(f'mode={mode}')
+
+        return params
 
 
 async def _handle(reader, writer):
@@ -555,7 +587,12 @@ async def _handle(reader, writer):
     Log.print(f'Client: new connection from {client.host}:{client.tcp_port}')
 
     while True:
-        data = await reader.read(2048)
+        try:
+            data = await reader.read(2048)
+        except ConnectionResetError:
+            await client.close()
+            Log.print(f'Client: connection reset: {client.host}:{client.tcp_port}')
+            return
 
         if data[0:1] == b'' or writer.transport.is_closing():
             await client.close()
