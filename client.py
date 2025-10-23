@@ -3,7 +3,7 @@ import re
 import string
 import time
 from random import choices, randrange
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 from typing import List, Optional
 
 from _config import Config
@@ -24,6 +24,8 @@ class Client:
         self._camera_state: Optional[CameraState] = None
         self._stream_tasks: List[asyncio.Task] = []
         self._stream_started = False
+        self._transport_protocol: Optional[str] = None
+        self._content_base: Optional[str] = None
 
     @staticmethod
     async def listen():
@@ -56,6 +58,7 @@ class Client:
             await self._response(
                 'Content-Type: application/sdp',
                 f'Content-Length: {len(sdp) + 4}',
+                f'Content-Base: {self._get_content_base()}',
                 '',
                 sdp)
 
@@ -93,7 +96,7 @@ class Client:
             await self._start_stream(camera)
 
             # In TCP mode we'll stop listening rtsp
-            if Config.tcp_mode:
+            if self._effective_transport() == 'tcp':
                 return True  # Handling is over, stop self._handle loop
 
         elif option == 'TEARDOWN':
@@ -156,7 +159,8 @@ class Client:
         clock_frequency = sdp['video']['clk_freq']  # i.e. 90000 in SDP a=rtpmap:96 H26*/90000
         rtptime = int(rtp_info["rtptime"][0]) + int(delta * clock_frequency)
 
-        res = f'RTP-Info: url=rtsp://{Config.local_ip}:{Config.rtsp_port}/track1;' \
+        base = self._get_content_base()
+        res = f'RTP-Info: url={base}track1;' \
             f'seq={rtp_info["seq"][0]};rtptime={rtptime}'
 
         if len(rtp_info['seq']) < 2:
@@ -165,7 +169,7 @@ class Client:
         clock_frequency = sdp['audio']['clk_freq']  # i.e. 8000 in SDP a=rtpmap:8 PCMA/8000
         rtptime = int(rtp_info["rtptime"][1]) + int(delta * clock_frequency)
 
-        res += f',url=rtsp://{Config.local_ip}:{Config.rtsp_port}/track2;' \
+        res += f',url={base}track2;' \
             f'seq={rtp_info["seq"][1]};rtptime={rtptime}'
 
         return res
@@ -174,22 +178,36 @@ class Client:
         """ Parse client's ask
         """
         Log.print(f'~~~ Client: read\n{ask}')
-        res = re.match(r'(.+?) rtsps?://.+?:\d+/?(.*?) .+?\r\n', ask)
-        if not res:
+        request_line = ask.split('\r\n', 1)[0]
+        parts = request_line.split()
+        if len(parts) < 3:
             raise RuntimeError('invalid ask')
+        option, uri = parts[0], parts[1]
+
+        parsed_uri = urlparse(uri)
+        if parsed_uri.scheme not in {'rtsp', 'rtsps'}:
+            raise RuntimeError('invalid ask')
+
+        camera_path = parsed_uri.path.lstrip('/')
+        if parsed_uri.params:
+            camera_path = f'{camera_path};{parsed_uri.params}' if camera_path else parsed_uri.params
+        if parsed_uri.query:
+            camera_path = f'{camera_path}?{parsed_uri.query}' if camera_path else parsed_uri.query
+        if parsed_uri.fragment:
+            camera_path = f'{camera_path}#{parsed_uri.fragment}' if camera_path else parsed_uri.fragment
 
         self.cseq = _get_cseq(ask)
         self.user_agent = _get_user_agent(ask)
 
-        option = res.group(1)
-
         if not self.camera_hash:
-            camera_hash = unquote(res.group(2))
+            camera_hash = unquote(camera_path)
             if camera_hash not in Shared.data:
                 raise RuntimeError('invalid camera hash')
 
             self.camera_hash = camera_hash
             self._camera_state = Shared.data[camera_hash]
+
+            self._content_base = self._build_content_base(parsed_uri)
 
             if not self._camera_state.camera:
                 camera = Camera(self._camera_state.source)
@@ -221,7 +239,7 @@ class Client:
 
         self._stream_started = True
 
-        if Config.tcp_mode:
+        if self._effective_transport() == 'tcp':
             task = asyncio.create_task(self._stream_tcp(camera))
             self._stream_tasks.append(task)
             return
@@ -286,19 +304,94 @@ class Client:
             await reader.close()
 
     def _get_transport_line(self, ask):
-        """ Search "interleaved" channels for TCP mode or client ports for UDP one
-            Returns "transport" string
-        """
-        if Config.tcp_mode:
-            res = re.match(r'.+?\nTransport:.+?interleaved=(\d-\d)', ask, re.DOTALL)
-            channel = res.group(1) if res else '0-1'
-            return f'Transport: RTP/AVP/TCP;unicast;interleaved={channel}'
+        """Parse the requested transport and build a response line."""
+        transport_header = _get_transport_header(ask)
+        if not transport_header:
+            if Config.tcp_mode:
+                self._transport_protocol = 'tcp'
+                return 'Transport: RTP/AVP/TCP;unicast;interleaved=0-1'
+            raise RuntimeError('transport header is missing')
 
-        udp_ports = _get_ports(ask)
+        candidates = [candidate.strip() for candidate in transport_header.split(',') if candidate.strip()]
+
+        chosen = None
+        protocol = None
+        for candidate in candidates:
+            if 'RTP/AVP/TCP' in candidate.upper():
+                chosen = candidate
+                protocol = 'tcp'
+                break
+
+        if not chosen:
+            for candidate in candidates:
+                upper = candidate.upper()
+                if 'RTP/AVP' in upper and 'RTP/AVP/TCP' not in upper:
+                    chosen = candidate
+                    protocol = 'udp'
+                    break
+
+        if not chosen:
+            raise RuntimeError('unsupported transport requested')
+
+        parts = [part.strip() for part in chosen.split(';') if part.strip()]
+        if not parts:
+            raise RuntimeError('invalid transport header')
+
+        protocol_token, *params = parts
+
+        if protocol == 'tcp':
+            interleaved = None
+            response_params = []
+            has_unicast = False
+            for param in params:
+                lower = param.lower()
+                if lower == 'unicast':
+                    has_unicast = True
+                    response_params.append('unicast')
+                elif lower.startswith('interleaved='):
+                    interleaved = param.split('=', 1)[1].strip()
+                else:
+                    response_params.append(param)
+
+            if not has_unicast:
+                response_params.insert(0, 'unicast')
+
+            response_params.append(f'interleaved={interleaved or "0-1"}')
+
+            self._transport_protocol = 'tcp'
+            return f'Transport: {";".join([protocol_token] + response_params)}'
+
+        udp_ports = _get_ports(chosen)
         idx = 0 if not self.udp_ports else 1
         self.udp_ports[idx] = udp_ports
 
-        return f'Transport: RTP/AVP;unicast;client_port={udp_ports[0]}-{udp_ports[1]};server_port=5998-5999'
+        response_params = []
+        has_unicast = False
+        has_client_port = False
+        for param in params:
+            lower = param.lower()
+            if lower == 'unicast':
+                has_unicast = True
+                response_params.append('unicast')
+            elif lower.startswith('client_port='):
+                has_client_port = True
+                value = param.split('=', 1)[1].strip()
+                response_params.append(f'client_port={value}')
+            elif lower.startswith('server_port='):
+                continue
+            else:
+                response_params.append(param)
+
+        if not has_unicast:
+            response_params.insert(0, 'unicast')
+
+        if not has_client_port:
+            raise RuntimeError('invalid transport ports')
+
+        response_params.append('server_port=5998-5999')
+
+        self._transport_protocol = 'udp'
+        return f'Transport: {";".join([protocol_token] + response_params)}'
 
     def _get_description(self):
         """ Create new SDP based on original one from the camera
@@ -347,6 +440,43 @@ class Client:
             for session_id in ws:
                 Log.write('Client: web limit exceeded, close old connection')
                 await clients[session_id].close()
+
+    def _effective_transport(self) -> str:
+        if self._transport_protocol:
+            return self._transport_protocol
+        return 'tcp' if Config.tcp_mode else 'udp'
+
+    def _build_content_base(self, parsed_uri):
+        netloc = parsed_uri.netloc
+        if not netloc:
+            host = getattr(Config, 'rtsp_host', None) or Config.local_ip
+            if ':' not in host:
+                netloc = f'{host}:{Config.rtsp_port}'
+            else:
+                netloc = host
+        scheme = parsed_uri.scheme or 'rtsp'
+        path = parsed_uri.path or '/'
+        if not path.endswith('/'):
+            path = f'{path}/'
+        return self._ensure_trailing_slash(f'{scheme}://{netloc}{path}')
+
+    def _get_content_base(self):
+        if self._content_base:
+            return self._ensure_trailing_slash(self._content_base)
+
+        host = getattr(Config, 'rtsp_host', None) or Config.local_ip
+        if ':' not in host:
+            netloc = f'{host}:{Config.rtsp_port}'
+        else:
+            netloc = host
+        path = f'/{self.camera_hash or ""}'
+        if not path.endswith('/'):
+            path += '/'
+        return self._ensure_trailing_slash(f'rtsp://{netloc}{path}')
+
+    @staticmethod
+    def _ensure_trailing_slash(value: str) -> str:
+        return value if value.endswith('/') else f'{value}/'
 
 
 async def _handle(reader, writer):
@@ -402,10 +532,18 @@ def _get_user_agent(ask):
     return res.group(1)
 
 
-def _get_ports(ask):
-    """ Search port numbers in rtsp ask
+def _get_transport_header(ask):
+    """Extract the Transport header value from the request."""
+    res = re.search(r'\nTransport:\s*([^\r\n]+)', ask, re.IGNORECASE)
+    if not res:
+        return None
+    return res.group(1).strip()
+
+
+def _get_ports(transport):
+    """ Search port numbers in transport string
     """
-    res = re.match(r'.+?\nTransport:[^\n]+client_port=(\d+)-(\d+)', ask, re.DOTALL)
+    res = re.search(r'client_port=(\d+)-(\d+)', transport, re.IGNORECASE)
     if not res:
         raise RuntimeError('invalid transport ports')
     return [int(res.group(1)), int(res.group(2))]
