@@ -24,7 +24,7 @@ class Client:
         self._camera_state: Optional[CameraState] = None
         self._stream_tasks: List[asyncio.Task] = []
         self._stream_started = False
-        self._transport_protocol: Optional[str] = 'tcp' if Config.tcp_mode else 'udp'
+        self._transport_protocol: Optional[str] = None
         self._content_base: Optional[str] = None
         self._track_aliases: Dict[str, int] = {}
 
@@ -313,36 +313,33 @@ class Client:
                 return 'Transport: RTP/AVP/TCP;unicast;interleaved=0-1'
             raise RuntimeError('transport header is missing')
 
-        if Config.tcp_mode:
-            match = re.search(r'interleaved=([0-9]+-[0-9]+)', transport_header, re.IGNORECASE)
-            channel = match.group(1) if match else '0-1'
-            self._transport_protocol = 'tcp'
-            return f'Transport: RTP/AVP/TCP;unicast;interleaved={channel}'
-
         candidates = [candidate.strip() for candidate in transport_header.split(',') if candidate.strip()]
 
-        chosen = None
-        protocol = None
+        udp_candidate = None
+        tcp_candidate = None
         for candidate in candidates:
             upper = candidate.upper()
             if 'MULTICAST' in upper:
                 continue
             if 'RTP/AVP/TCP' in upper:
-                if Config.tcp_mode:
-                    chosen = candidate
-                    protocol = 'tcp'
-                    break
+                if not tcp_candidate:
+                    tcp_candidate = candidate
                 continue
+            if 'RTP/AVP' in upper:
+                if not udp_candidate:
+                    udp_candidate = candidate
 
-        if not chosen:
-            for candidate in candidates:
-                upper = candidate.upper()
-                if 'MULTICAST' in upper:
-                    continue
-                if 'RTP/AVP' in upper and 'RTP/AVP/TCP' not in upper:
-                    chosen = candidate
-                    protocol = 'udp'
-                    break
+        chosen = None
+        protocol = None
+        if Config.tcp_mode and tcp_candidate:
+            chosen = tcp_candidate
+            protocol = 'tcp'
+        elif udp_candidate:
+            chosen = udp_candidate
+            protocol = 'udp'
+        elif tcp_candidate:
+            chosen = tcp_candidate
+            protocol = 'tcp'
 
         if not chosen:
             raise RuntimeError('unsupported transport requested')
