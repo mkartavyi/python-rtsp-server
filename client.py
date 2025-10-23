@@ -4,6 +4,7 @@ import string
 import time
 from random import choices, randrange
 from urllib.parse import unquote, urlparse
+
 from typing import Dict, List, Optional
 
 from _config import Config
