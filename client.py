@@ -4,7 +4,8 @@ import string
 import time
 from random import choices, randrange
 from urllib.parse import unquote, urlparse
-from typing import List, Optional
+
+from typing import Dict, List, Optional
 
 from _config import Config
 from shared import Shared, CameraState
@@ -26,6 +27,7 @@ class Client:
         self._stream_started = False
         self._transport_protocol: Optional[str] = None
         self._content_base: Optional[str] = None
+        self._track_aliases: Dict[str, int] = {}
 
     @staticmethod
     async def listen():
@@ -314,21 +316,31 @@ class Client:
 
         candidates = [candidate.strip() for candidate in transport_header.split(',') if candidate.strip()]
 
+        udp_candidate = None
+        tcp_candidate = None
+        for candidate in candidates:
+            upper = candidate.upper()
+            if 'MULTICAST' in upper:
+                continue
+            if 'RTP/AVP/TCP' in upper:
+                if not tcp_candidate:
+                    tcp_candidate = candidate
+                continue
+            if 'RTP/AVP' in upper:
+                if not udp_candidate:
+                    udp_candidate = candidate
+
         chosen = None
         protocol = None
-        for candidate in candidates:
-            if 'RTP/AVP/TCP' in candidate.upper():
-                chosen = candidate
-                protocol = 'tcp'
-                break
-
-        if not chosen:
-            for candidate in candidates:
-                upper = candidate.upper()
-                if 'RTP/AVP' in upper and 'RTP/AVP/TCP' not in upper:
-                    chosen = candidate
-                    protocol = 'udp'
-                    break
+        if Config.tcp_mode and tcp_candidate:
+            chosen = tcp_candidate
+            protocol = 'tcp'
+        elif udp_candidate:
+            chosen = udp_candidate
+            protocol = 'udp'
+        elif tcp_candidate:
+            chosen = tcp_candidate
+            protocol = 'tcp'
 
         if not chosen:
             raise RuntimeError('unsupported transport requested')
@@ -362,8 +374,11 @@ class Client:
             return f'Transport: {";".join([protocol_token] + response_params)}'
 
         udp_ports = _get_ports(chosen)
-        idx = 0 if not self.udp_ports else 1
-        self.udp_ports[idx] = udp_ports
+        track_idx = self._resolve_track_index(ask)
+        if track_idx is None:
+            track_idx = 0 if not self.udp_ports else max(self.udp_ports.keys(), default=-1) + 1
+
+        self.udp_ports[track_idx] = udp_ports
 
         response_params = []
         has_unicast = False
@@ -373,11 +388,17 @@ class Client:
             if lower == 'unicast':
                 has_unicast = True
                 response_params.append('unicast')
+            elif lower == 'multicast':
+                continue
             elif lower.startswith('client_port='):
                 has_client_port = True
                 value = param.split('=', 1)[1].strip()
                 response_params.append(f'client_port={value}')
             elif lower.startswith('server_port='):
+                continue
+            elif lower.startswith('destination=') or lower.startswith('source='):
+                continue
+            elif lower.startswith('ttl='):
                 continue
             else:
                 response_params.append(param)
@@ -388,7 +409,9 @@ class Client:
         if not has_client_port:
             raise RuntimeError('invalid transport ports')
 
-        response_params.append('server_port=5998-5999')
+        server_ports = self._format_server_ports(track_idx)
+        if server_ports:
+            response_params.append(server_ports)
 
         self._transport_protocol = 'udp'
         return f'Transport: {";".join([protocol_token] + response_params)}'
@@ -400,6 +423,13 @@ class Client:
             raise RuntimeError('camera is not initialised')
 
         sdp = self._camera_state.camera.description
+        self._track_aliases = {}
+
+        camera = self._camera_state.camera if self._camera_state else None
+        if camera:
+            for idx, track_id in enumerate(camera.track_ids):
+                self._track_aliases[track_id.lower()] = idx
+
         res = 'v=0\r\n' \
             f'o=- {randrange(100000, 999999)} {randrange(1, 10)} IN IP4 {Config.local_ip}\r\n' \
             's=python-rtsp-server\r\n' \
@@ -414,12 +444,14 @@ class Client:
             f'a=rtpmap:{sdp["video"]["rtpmap"]}\r\n' \
             f'a=fmtp:{sdp["video"]["format"]}\r\n' \
             'a=control:track1'
+        self._track_aliases.setdefault('track1', 0)
 
         if not sdp['audio']:
             return res
         res += f'\r\nm=audio {sdp["audio"]["media"]}\r\n' \
             f'a=rtpmap:{sdp["audio"]["rtpmap"]}\r\n' \
             'a=control:track2'
+        self._track_aliases.setdefault('track2', 1)
         return res
 
     async def _check_web_limit(self):
@@ -477,6 +509,43 @@ class Client:
     @staticmethod
     def _ensure_trailing_slash(value: str) -> str:
         return value if value.endswith('/') else f'{value}/'
+
+    def _resolve_track_index(self, ask: str) -> Optional[int]:
+        request_line = ask.split('\r\n', 1)[0]
+        parts = request_line.split()
+        if len(parts) < 2:
+            return None
+
+        uri = parts[1]
+        parsed_uri = urlparse(uri)
+        segment = parsed_uri.path.rstrip('/').split('/')[-1].lower()
+        if not segment:
+            return None
+
+        if segment in self._track_aliases:
+            return self._track_aliases[segment]
+
+        match = re.search(r'(trackid=|track)(\d+)', segment)
+        if match:
+            value = int(match.group(2))
+            for alias in (f'track{value}', f'trackid={value}'):
+                if alias in self._track_aliases:
+                    return self._track_aliases[alias]
+            if match.group(1) == 'track':
+                return max(value - 1, 0)
+            return value
+
+        return None
+
+    def _format_server_ports(self, track_idx: int) -> Optional[str]:
+        camera = self._camera_state.camera if self._camera_state else None
+        if camera and 0 <= track_idx < len(camera.udp_ports):
+            ports = camera.udp_ports[track_idx]
+            if len(ports) >= 2:
+                return f'server_port={ports[0]}-{ports[1]}'
+
+        base_port = Config.start_udp_port + track_idx * 2
+        return f'server_port={base_port}-{base_port + 1}'
 
 
 async def _handle(reader, writer):
