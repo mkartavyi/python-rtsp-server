@@ -4,7 +4,6 @@ import string
 import time
 from random import choices, randrange
 from urllib.parse import unquote, urlparse
-from collections.abc import Iterable
 from typing import Dict, List, Optional
 
 from _config import Config
@@ -189,6 +188,35 @@ class Client:
         parsed_uri = urlparse(uri)
         if parsed_uri.scheme not in {'rtsp', 'rtsps'}:
             raise RuntimeError('invalid ask')
+        option, uri = parts[0], parts[1]
+
+        parsed_uri = urlparse(uri)
+        if parsed_uri.scheme not in {'rtsp', 'rtsps'}:
+            raise RuntimeError('invalid ask')
+
+        camera_path = parsed_uri.path.lstrip('/')
+        if parsed_uri.params:
+            camera_path = f'{camera_path};{parsed_uri.params}' if camera_path else parsed_uri.params
+        if parsed_uri.query:
+            camera_path = f'{camera_path}?{parsed_uri.query}' if camera_path else parsed_uri.query
+        if parsed_uri.fragment:
+            camera_path = f'{camera_path}#{parsed_uri.fragment}' if camera_path else parsed_uri.fragment
+
+        camera_path = parsed_uri.path.lstrip('/')
+        if parsed_uri.params:
+            camera_path = f'{camera_path};{parsed_uri.params}' if camera_path else parsed_uri.params
+        if parsed_uri.query:
+            camera_path = f'{camera_path}?{parsed_uri.query}' if camera_path else parsed_uri.query
+        if parsed_uri.fragment:
+            camera_path = f'{camera_path}#{parsed_uri.fragment}' if camera_path else parsed_uri.fragment
+
+        camera_path = parsed_uri.path.lstrip('/')
+        if parsed_uri.params:
+            camera_path = f'{camera_path};{parsed_uri.params}' if camera_path else parsed_uri.params
+        if parsed_uri.query:
+            camera_path = f'{camera_path}?{parsed_uri.query}' if camera_path else parsed_uri.query
+        if parsed_uri.fragment:
+            camera_path = f'{camera_path}#{parsed_uri.fragment}' if camera_path else parsed_uri.fragment
 
         camera_path = parsed_uri.path.lstrip('/')
         if parsed_uri.params:
@@ -332,15 +360,15 @@ class Client:
 
         chosen = None
         protocol = None
-        supports_tcp = bool(Config.tcp_mode)
-        supports_udp = not Config.tcp_mode
-
-        if supports_tcp and tcp_candidate:
+        if Config.tcp_mode and tcp_candidate:
             chosen = tcp_candidate
             protocol = 'tcp'
-        elif supports_udp and udp_candidate:
+        elif udp_candidate:
             chosen = udp_candidate
             protocol = 'udp'
+        elif tcp_candidate:
+            chosen = tcp_candidate
+            protocol = 'tcp'
 
         if not chosen:
             raise RuntimeError('unsupported transport requested')
@@ -371,7 +399,7 @@ class Client:
             response_params.append(f'interleaved={interleaved or "0-1"}')
 
             self._transport_protocol = 'tcp'
-            return self._format_transport_response(protocol_token, response_params)
+            return f'Transport: {";".join([protocol_token] + response_params)}'
 
         udp_ports = _get_ports(chosen)
         track_idx = self._resolve_track_index(ask)
@@ -409,10 +437,14 @@ class Client:
         if not has_client_port:
             raise RuntimeError('invalid transport ports')
 
-        response_params.extend(self._format_server_ports(track_idx))
+        for param in self._format_server_ports(track_idx):
+            response_params.append(param)
+        server_ports = self._format_server_ports(track_idx)
+        if server_ports:
+            response_params.append(server_ports)
 
         self._transport_protocol = 'udp'
-        return self._format_transport_response(protocol_token, response_params)
+        return f'Transport: {";".join([protocol_token] + response_params)}'
 
     def _get_description(self):
         """ Create new SDP based on original one from the camera
@@ -562,23 +594,6 @@ class Client:
                     params.append(f'mode={mode}')
 
         return params
-
-    def _format_transport_response(self, protocol_token: str, params: List[str]) -> str:
-        flat_params: List[str] = []
-
-        def _append(value):
-            if value is None:
-                return
-            flat_params.append(str(value))
-
-        for param in params:
-            if isinstance(param, Iterable) and not isinstance(param, (str, bytes)):
-                for item in param:
-                    _append(item)
-            else:
-                _append(param)
-
-        return f'Transport: {";".join([protocol_token] + flat_params)}'
 
 
 async def _handle(reader, writer):
