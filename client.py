@@ -226,6 +226,14 @@ class Client:
         if parsed_uri.fragment:
             camera_path = f'{camera_path}#{parsed_uri.fragment}' if camera_path else parsed_uri.fragment
 
+        camera_path = parsed_uri.path.lstrip('/')
+        if parsed_uri.params:
+            camera_path = f'{camera_path};{parsed_uri.params}' if camera_path else parsed_uri.params
+        if parsed_uri.query:
+            camera_path = f'{camera_path}?{parsed_uri.query}' if camera_path else parsed_uri.query
+        if parsed_uri.fragment:
+            camera_path = f'{camera_path}#{parsed_uri.fragment}' if camera_path else parsed_uri.fragment
+
         self.cseq = _get_cseq(ask)
         self.user_agent = _get_user_agent(ask)
 
