@@ -26,6 +26,7 @@ class Camera:
         self.writer: Optional[asyncio.StreamWriter] = None
         self.udp_transports: Dict[int, asyncio.DatagramTransport] = {}
         self.buffers: Dict[BufferKey, RTPPacketBuffer] = {}
+        self.transport_params: Dict[int, Dict[str, Optional[str]]] = {}
         self._connect_lock = asyncio.Lock()
         self._play_lock = asyncio.Lock()
         self._interleave_task: Optional[asyncio.Task] = None
@@ -72,14 +73,17 @@ class Camera:
                 f'{self.url["url"]}/{self.track_ids[0]}',
                 self._get_transport_line(0))
 
+            self._store_transport_params(0, reply)
             self.session_id = _get_session_id(reply)
 
             if len(self.track_ids) > 1:
-                await self._request(
+                reply, _code = await self._request(
                     'SETUP',
                     f'{self.url["url"]}/{self.track_ids[1]}',
                     self._get_transport_line(1),
                     f'Session: {self.session_id}')
+
+                self._store_transport_params(1, reply)
 
             self.rtp_info = None
             self._connected = True
@@ -156,6 +160,7 @@ class Camera:
         self._loop = None
         self.buffers = {}
         self.rtp_info = None
+        self.transport_params = {}
 
         Log.write(f'Camera: closed [{self.hash}]')
 
@@ -227,6 +232,16 @@ class Camera:
             Log.print('Camera: error: invalid reply')
             return reply, 0
         return reply, int(res.group(1))
+
+    def get_transport_params(self, idx: int) -> Dict[str, Optional[str]]:
+        return self.transport_params.get(idx, {})
+
+    def _store_transport_params(self, idx: int, reply: Optional[str]) -> None:
+        if not reply:
+            return
+        params = _parse_transport_params(reply)
+        if params is not None:
+            self.transport_params[idx] = params
 
     def _write(self, option, url, *lines):
         cmd = f'{option} {url} RTSP/1.0\r\n' \
@@ -373,6 +388,27 @@ def _get_description(reply):
             details['audio']['clk_freq'] = int(res.group(2))
 
     return details
+
+
+def _parse_transport_params(reply: str) -> Optional[Dict[str, Optional[str]]]:
+    res = re.search(r'\nTransport:\s*([^\r\n]+)', reply, re.IGNORECASE)
+    if not res:
+        return None
+
+    line = res.group(1)
+    parts = [part.strip() for part in line.split(';') if part.strip()]
+    if not parts:
+        return None
+
+    params: Dict[str, Optional[str]] = {}
+    for token in parts[1:]:
+        if '=' in token:
+            key, value = token.split('=', 1)
+            params[key.lower()] = value.strip()
+        else:
+            params[token.lower()] = None
+
+    return params
 
 
 def _get_track_ids(reply):
