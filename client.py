@@ -27,6 +27,8 @@ class Client:
         self._transport_protocol: Optional[str] = None
         self._content_base: Optional[str] = None
         self._track_aliases: Dict[str, int] = {}
+        self._interleaved = False
+        self._interleaved_channels: Dict[int, int] = {}
 
     @staticmethod
     async def listen():
@@ -95,10 +97,6 @@ class Client:
             Log.write(info, self.host)
 
             await self._start_stream(camera)
-
-            # In TCP mode we'll stop listening rtsp
-            if self._effective_transport() == 'tcp':
-                return True  # Handling is over, stop self._handle loop
 
         elif option == 'TEARDOWN':
             await self._response(f'Session: {self.session_id}')
@@ -188,43 +186,6 @@ class Client:
         parsed_uri = urlparse(uri)
         if parsed_uri.scheme not in {'rtsp', 'rtsps'}:
             raise RuntimeError('invalid ask')
-        option, uri = parts[0], parts[1]
-
-        parsed_uri = urlparse(uri)
-        if parsed_uri.scheme not in {'rtsp', 'rtsps'}:
-            raise RuntimeError('invalid ask')
-
-        camera_path = parsed_uri.path.lstrip('/')
-        if parsed_uri.params:
-            camera_path = f'{camera_path};{parsed_uri.params}' if camera_path else parsed_uri.params
-        if parsed_uri.query:
-            camera_path = f'{camera_path}?{parsed_uri.query}' if camera_path else parsed_uri.query
-        if parsed_uri.fragment:
-            camera_path = f'{camera_path}#{parsed_uri.fragment}' if camera_path else parsed_uri.fragment
-
-        camera_path = parsed_uri.path.lstrip('/')
-        if parsed_uri.params:
-            camera_path = f'{camera_path};{parsed_uri.params}' if camera_path else parsed_uri.params
-        if parsed_uri.query:
-            camera_path = f'{camera_path}?{parsed_uri.query}' if camera_path else parsed_uri.query
-        if parsed_uri.fragment:
-            camera_path = f'{camera_path}#{parsed_uri.fragment}' if camera_path else parsed_uri.fragment
-
-        camera_path = parsed_uri.path.lstrip('/')
-        if parsed_uri.params:
-            camera_path = f'{camera_path};{parsed_uri.params}' if camera_path else parsed_uri.params
-        if parsed_uri.query:
-            camera_path = f'{camera_path}?{parsed_uri.query}' if camera_path else parsed_uri.query
-        if parsed_uri.fragment:
-            camera_path = f'{camera_path}#{parsed_uri.fragment}' if camera_path else parsed_uri.fragment
-
-        camera_path = parsed_uri.path.lstrip('/')
-        if parsed_uri.params:
-            camera_path = f'{camera_path};{parsed_uri.params}' if camera_path else parsed_uri.params
-        if parsed_uri.query:
-            camera_path = f'{camera_path}?{parsed_uri.query}' if camera_path else parsed_uri.query
-        if parsed_uri.fragment:
-            camera_path = f'{camera_path}#{parsed_uri.fragment}' if camera_path else parsed_uri.fragment
 
         camera_path = parsed_uri.path.lstrip('/')
         if parsed_uri.params:
@@ -280,6 +241,7 @@ class Client:
         if self._effective_transport() == 'tcp':
             task = asyncio.create_task(self._stream_tcp(camera))
             self._stream_tasks.append(task)
+            self._interleaved = True
             return
 
         tracks = [idx for idx in camera.get_tracks() if idx in self.udp_ports]
@@ -305,23 +267,85 @@ class Client:
 
         self._stream_tasks.clear()
         self._stream_started = False
+        self._interleaved = False
+        self._interleaved_channels.clear()
 
     async def _stream_tcp(self, camera: Camera):
-        reader = await camera.create_reader('tcp')
+        # Prefer the camera's native interleaved stream when available.
         try:
-            while True:
-                packet = await reader.read()
-                if packet is None:
-                    break
-                if self.writer.transport.is_closing():
-                    break
-                self.writer.write(packet)
+            reader = await camera.create_reader('tcp')
+        except RuntimeError:
+            reader = None
+
+        if reader is not None:
+            try:
+                while True:
+                    packet = await reader.read()
+                    if packet is None or self.writer.transport.is_closing():
+                        break
+                    self.writer.write(packet)
+                    await self.writer.drain()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                Log.print(f'Client: tcp stream error [{self.camera_hash}]: {e}')
+            finally:
+                await reader.close()
+            return
+
+        tracks = [idx for idx in camera.get_tracks() if isinstance(idx, int)]
+        if not tracks:
+            Log.print(f'Client: tcp stream error [{self.camera_hash}]: no tracks available')
+            return
+
+        stop_event = asyncio.Event()
+        tasks: List[asyncio.Task] = []
+        readers: List = []
+
+        async def _forward_track(track_idx: int):
+            try:
+                reader = await camera.create_reader(track_idx)
+            except Exception as e:
+                Log.print(f'Client: tcp stream error [{self.camera_hash}]: {e}')
+                stop_event.set()
+                return
+
+            readers.append(reader)
+            channel = self._interleaved_channels.get(track_idx, track_idx * 2)
+            channel = min(channel, 255)
+            try:
+                while not self.writer.transport.is_closing():
+                    packet = await reader.read()
+                    if packet is None:
+                        break
+                    frame = b'$' + bytes([channel]) + len(packet).to_bytes(2, 'big') + packet
+                    self.writer.write(frame)
+                    await self.writer.drain()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                Log.print(f'Client: tcp stream error [{self.camera_hash}]: {e}')
+            finally:
+                stop_event.set()
+
+        for idx in tracks:
+            tasks.append(asyncio.create_task(_forward_track(idx)))
+
+        try:
+            await stop_event.wait()
         except asyncio.CancelledError:
+            stop_event.set()
             raise
-        except Exception as e:
-            Log.print(f'Client: tcp stream error [{self.camera_hash}]: {e}')
         finally:
-            await reader.close()
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            for reader in readers:
+                await reader.close()
 
     async def _stream_udp(self, camera: Camera, track_idx: int):
         reader = await camera.create_reader(track_idx)
@@ -362,7 +386,7 @@ class Client:
                 if not tcp_candidate:
                     tcp_candidate = candidate
                 continue
-            if 'RTP/AVP' in upper:
+            if 'RTP/AVP' in upper and 'TCP' not in upper:
                 if not udp_candidate:
                     udp_candidate = candidate
 
@@ -387,6 +411,11 @@ class Client:
 
         protocol_token, *params = parts
 
+        track_idx = self._resolve_track_index(ask)
+        if track_idx is None:
+            mapping = self._interleaved_channels if protocol == 'tcp' else self.udp_ports
+            track_idx = max(mapping.keys(), default=-1) + 1 if mapping else 0
+
         if protocol == 'tcp':
             interleaved = None
             response_params = []
@@ -404,15 +433,24 @@ class Client:
             if not has_unicast:
                 response_params.insert(0, 'unicast')
 
-            response_params.append(f'interleaved={interleaved or "0-1"}')
+            channel_base = None
+            if interleaved:
+                try:
+                    start = interleaved.split('-', 1)[0]
+                    channel_base = int(start)
+                except ValueError:
+                    channel_base = None
+            if channel_base is None:
+                channel_base = track_idx * 2
+                interleaved = f'{channel_base}-{channel_base + 1}'
+
+            response_params.append(f'interleaved={interleaved}')
 
             self._transport_protocol = 'tcp'
+            self._interleaved_channels[track_idx] = channel_base
             return f'Transport: {";".join([protocol_token] + response_params)}'
 
         udp_ports = _get_ports(chosen)
-        track_idx = self._resolve_track_index(ask)
-        if track_idx is None:
-            track_idx = 0 if not self.udp_ports else max(self.udp_ports.keys(), default=-1) + 1
 
         self.udp_ports[track_idx] = udp_ports
 
@@ -445,11 +483,7 @@ class Client:
         if not has_client_port:
             raise RuntimeError('invalid transport ports')
 
-        for param in self._format_server_ports(track_idx):
-            response_params.append(param)
-        server_ports = self._format_server_ports(track_idx)
-        if server_ports:
-            response_params.append(server_ports)
+        response_params.extend(self._format_server_ports(track_idx))
 
         self._transport_protocol = 'udp'
         return f'Transport: {";".join([protocol_token] + response_params)}'
@@ -515,6 +549,20 @@ class Client:
         if self._transport_protocol:
             return self._transport_protocol
         return 'tcp' if Config.tcp_mode else 'udp'
+
+    def is_interleaved(self) -> bool:
+        return self._interleaved
+
+    async def handle_interleaved(self, channel: int, payload: bytes) -> None:
+        camera = self._camera_state.camera if self._camera_state else None
+        if not camera:
+            return
+
+        if 'tcp' in camera.buffers:
+            try:
+                await camera.send_interleaved(channel, payload)
+            except Exception as e:
+                Log.print(f'Client: error forwarding interleaved data [{self.camera_hash}]: {e}')
 
     def _build_content_base(self, parsed_uri):
         netloc = parsed_uri.netloc
@@ -610,27 +658,58 @@ async def _handle(reader, writer):
     client = Client(reader, writer)
     Log.print(f'Client: new connection from {client.host}:{client.tcp_port}')
 
+    buffer = b''
     while True:
         try:
-            data = await reader.read(2048)
+            chunk = await reader.read(4096)
         except ConnectionResetError:
             await client.close()
             Log.print(f'Client: connection reset: {client.host}:{client.tcp_port}')
             return
 
-        if data[0:1] == b'' or writer.transport.is_closing():
+        if chunk[0:1] == b'' or writer.transport.is_closing():
             await client.close()
             Log.print(f'Client: connection closed: {client.host}:{client.tcp_port}')
             return
 
-        # Handle client connection
-        try:
-            if await client.handle(data):  # start TCP mode listening, handling is over
+        buffer += chunk
+
+        while buffer:
+            if buffer.startswith(b'$'):
+                if len(buffer) < 4:
+                    break
+                channel = buffer[1]
+                length = int.from_bytes(buffer[2:4], 'big')
+                if len(buffer) < 4 + length:
+                    break
+                payload = buffer[4:4 + length]
+                buffer = buffer[4 + length:]
+
+                if client.is_interleaved():
+                    try:
+                        await client.handle_interleaved(channel, payload)
+                    except Exception as e:
+                        Log.print(f'Client: error handling interleaved data from {client.host}: {e}')
+                continue
+
+            header_end = buffer.find(b'\r\n\r\n')
+            if header_end == -1:
+                break
+
+            content_length = _get_content_length(buffer[:header_end + 4])
+            total_length = header_end + 4 + content_length
+            if len(buffer) < total_length:
+                break
+
+            message = buffer[:total_length]
+            buffer = buffer[total_length:]
+
+            try:
+                await client.handle(message)
+            except Exception as e:
+                Log.print(f"Client: error: can't handle request from {client.host}: {e}")
+                await client.close()
                 return
-        except Exception as e:
-            Log.print(f"Client: error: can't handle request from {client.host}: {e}")
-            await client.close()
-            return
 
 
 def _get_session_id(ask):
@@ -668,6 +747,13 @@ def _get_transport_header(ask):
     if not res:
         return None
     return res.group(1).strip()
+
+
+def _get_content_length(headers: bytes) -> int:
+    match = re.search(br'\bContent-Length:\s*(\d+)', headers, re.IGNORECASE)
+    if not match:
+        return 0
+    return int(match.group(1))
 
 
 def _get_ports(transport):
