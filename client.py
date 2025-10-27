@@ -311,8 +311,7 @@ class Client:
                 return
 
             readers.append(reader)
-            channel = self._interleaved_channels.get(track_idx, track_idx * 2)
-            channel = min(channel, 255)
+            channel = min(track_idx * 2, 255)
             try:
                 while not self.writer.transport.is_closing():
                     packet = await reader.read()
