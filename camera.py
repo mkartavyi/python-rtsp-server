@@ -198,32 +198,64 @@ class Camera:
 
     async def _interleave(self):
         buffer = self.buffers.get('tcp')
+        if not buffer:
+            return
+
         try:
-            while self._playing and self.reader and buffer:
-                frame = await self.reader.read(2048)
-                if not frame:
+            while self._playing and self.reader:
+                prefix = await self.reader.read(1)
+                if not prefix:
                     Log.print(f'Camera: interleaved stream ended [{self.hash}]')
                     break
-                await buffer.append(frame)
+
+                if prefix != b'$':
+                    header = await self.reader.readuntil(b'\r\n\r\n')
+                    message = prefix + header
+
+                    content_length = 0
+                    match = re.search(br'\bContent-Length:\s*(\d+)', message, re.IGNORECASE)
+                    if match:
+                        content_length = int(match.group(1))
+                    if content_length:
+                        body = await self.reader.readexactly(content_length)
+                        message += body
+
+                    try:
+                        Log.print(f'~~~ Camera: read:\n{message.decode()}')
+                    except Exception:
+                        Log.print('Camera: warning: failed to decode RTSP reply during interleave')
+                    continue
+
+                channel = await self.reader.readexactly(1)
+                length_bytes = await self.reader.readexactly(2)
+                length = int.from_bytes(length_bytes, 'big')
+                payload = await self.reader.readexactly(length)
+
+                packet = b''.join((prefix, channel, length_bytes, payload))
+                await buffer.append(packet)
+        except asyncio.IncompleteReadError:
+            Log.print(f'Camera: interleaved stream ended unexpectedly [{self.hash}]')
         except asyncio.CancelledError:
             raise
         except Exception as e:
             Log.print(f'Camera: error while reading interleaved data [{self.hash}]: {e}')
         finally:
-            if buffer:
-                await buffer.close()
+            await buffer.close()
 
     async def _request(self, option, url, *lines):
         """Ask the camera option with given lines. Returns reply and status code."""
         self._write(option, url, *lines)
 
-        data = await self.reader.read(2048)
+        reply_bytes = await self._read_rtsp_reply()
+        if reply_bytes is None:
+            Log.print('Camera: error: empty reply')
+            return None, 0
 
-        if data[0:1] == b'$':
-            Log.print('Camera: read: interleaved binary data')
-            return None, 200
-
-        reply = data.decode()
+        try:
+            reply = reply_bytes.decode()
+        except Exception:
+            Log.print('Camera: error: invalid reply encoding')
+            return None, 0
 
         Log.print(f'~~~ Camera: read:\n{reply}')
 
@@ -232,6 +264,40 @@ class Camera:
             Log.print('Camera: error: invalid reply')
             return reply, 0
         return reply, int(res.group(1))
+
+    async def _read_rtsp_reply(self) -> Optional[bytes]:
+        while True:
+            prefix = await self.reader.read(1)
+            if not prefix:
+                return None
+
+            if prefix == b'$':
+                try:
+                    channel = await self.reader.readexactly(1)
+                    length_bytes = await self.reader.readexactly(2)
+                    length = int.from_bytes(length_bytes, 'big')
+                    payload = await self.reader.readexactly(length)
+                except asyncio.IncompleteReadError:
+                    return None
+
+                packet = b''.join((prefix, channel, length_bytes, payload))
+                buffer = self.buffers.get('tcp')
+                if buffer:
+                    await buffer.append(packet)
+                continue
+
+            header = await self.reader.readuntil(b'\r\n\r\n')
+            message = prefix + header
+
+            content_length = 0
+            match = re.search(br'\bContent-Length:\s*(\d+)', message, re.IGNORECASE)
+            if match:
+                content_length = int(match.group(1))
+            if content_length:
+                body = await self.reader.readexactly(content_length)
+                message += body
+
+            return message
 
     def get_transport_params(self, idx: int) -> Dict[str, Optional[str]]:
         return self.transport_params.get(idx, {})

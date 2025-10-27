@@ -307,21 +307,80 @@ class Client:
         self._stream_started = False
 
     async def _stream_tcp(self, camera: Camera):
-        reader = await camera.create_reader('tcp')
+        # Prefer the camera's native interleaved stream when available.
         try:
-            while True:
-                packet = await reader.read()
-                if packet is None:
-                    break
-                if self.writer.transport.is_closing():
-                    break
-                self.writer.write(packet)
+            reader = await camera.create_reader('tcp')
+        except RuntimeError:
+            reader = None
+
+        if reader is not None:
+            try:
+                while True:
+                    packet = await reader.read()
+                    if packet is None or self.writer.transport.is_closing():
+                        break
+                    self.writer.write(packet)
+                    await self.writer.drain()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                Log.print(f'Client: tcp stream error [{self.camera_hash}]: {e}')
+            finally:
+                await reader.close()
+            return
+
+        tracks = [idx for idx in camera.get_tracks() if isinstance(idx, int)]
+        if not tracks:
+            Log.print(f'Client: tcp stream error [{self.camera_hash}]: no tracks available')
+            return
+
+        stop_event = asyncio.Event()
+        tasks: List[asyncio.Task] = []
+        readers: List = []
+
+        async def _forward_track(track_idx: int):
+            try:
+                reader = await camera.create_reader(track_idx)
+            except Exception as e:
+                Log.print(f'Client: tcp stream error [{self.camera_hash}]: {e}')
+                stop_event.set()
+                return
+
+            readers.append(reader)
+            channel = min(track_idx * 2, 255)
+            try:
+                while not self.writer.transport.is_closing():
+                    packet = await reader.read()
+                    if packet is None:
+                        break
+                    frame = b'$' + bytes([channel]) + len(packet).to_bytes(2, 'big') + packet
+                    self.writer.write(frame)
+                    await self.writer.drain()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                Log.print(f'Client: tcp stream error [{self.camera_hash}]: {e}')
+            finally:
+                stop_event.set()
+
+        for idx in tracks:
+            tasks.append(asyncio.create_task(_forward_track(idx)))
+
+        try:
+            await stop_event.wait()
         except asyncio.CancelledError:
+            stop_event.set()
             raise
-        except Exception as e:
-            Log.print(f'Client: tcp stream error [{self.camera_hash}]: {e}')
         finally:
-            await reader.close()
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            for reader in readers:
+                await reader.close()
 
     async def _stream_udp(self, camera: Camera, track_idx: int):
         reader = await camera.create_reader(track_idx)
@@ -362,7 +421,7 @@ class Client:
                 if not tcp_candidate:
                     tcp_candidate = candidate
                 continue
-            if 'RTP/AVP' in upper:
+            if 'RTP/AVP' in upper and 'TCP' not in upper:
                 if not udp_candidate:
                     udp_candidate = candidate
 
@@ -445,11 +504,7 @@ class Client:
         if not has_client_port:
             raise RuntimeError('invalid transport ports')
 
-        for param in self._format_server_ports(track_idx):
-            response_params.append(param)
-        server_ports = self._format_server_ports(track_idx)
-        if server_ports:
-            response_params.append(server_ports)
+        response_params.extend(self._format_server_ports(track_idx))
 
         self._transport_protocol = 'udp'
         return f'Transport: {";".join([protocol_token] + response_params)}'
