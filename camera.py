@@ -183,6 +183,16 @@ class Camera:
         except Exception as e:
             Log.print(f'Camera: error sending UDP packet [{self.hash}]: {e}')
 
+    async def send_interleaved(self, channel: int, payload: bytes) -> None:
+        if not self.writer or self.writer.transport.is_closing():
+            return
+        frame = b'$' + bytes([channel]) + len(payload).to_bytes(2, 'big') + payload
+        try:
+            self.writer.write(frame)
+            await self.writer.drain()
+        except Exception as e:
+            Log.print(f'Camera: error sending interleaved packet [{self.hash}]: {e}')
+
     def handle_udp_packet(self, idx: int, data: bytes) -> None:
         buffer = self.buffers.get(idx)
         if not buffer:
