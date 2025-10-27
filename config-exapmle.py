@@ -52,8 +52,9 @@ class Config:
     # Check UDP traffic from cameras, secs
     watchdog_interval = 30
 
-    # Run this script with root permissions or change this path and set up log rotation yourself
-    log_file = '/var/log/python-rtsp-server.log'
+    # Update this path if you want the log file somewhere else. Relative paths
+    # are resolved against the working directory of the server process.
+    log_file = 'python-rtsp-server.log'
 
     # Attention!
     # All files and subdirectories older than "storage_period_days" in this folder will be deleted!

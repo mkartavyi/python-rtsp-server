@@ -362,7 +362,7 @@ class Client:
                 if not tcp_candidate:
                     tcp_candidate = candidate
                 continue
-            if 'RTP/AVP' in upper:
+            if 'RTP/AVP' in upper and 'TCP' not in upper:
                 if not udp_candidate:
                     udp_candidate = candidate
 
@@ -445,11 +445,7 @@ class Client:
         if not has_client_port:
             raise RuntimeError('invalid transport ports')
 
-        for param in self._format_server_ports(track_idx):
-            response_params.append(param)
-        server_ports = self._format_server_ports(track_idx)
-        if server_ports:
-            response_params.append(server_ports)
+        response_params.extend(self._format_server_ports(track_idx))
 
         self._transport_protocol = 'udp'
         return f'Transport: {";".join([protocol_token] + response_params)}'
