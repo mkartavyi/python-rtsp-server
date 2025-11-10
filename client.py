@@ -54,7 +54,19 @@ class Client:
         self.session_id = _get_session_id(ask)
 
         if option == 'OPTIONS':
-            await self._response('Public: OPTIONS, DESCRIBE, SETUP, TEARDOWN, PLAY')
+            headers = ['Public: OPTIONS, DESCRIBE, SETUP, TEARDOWN, PLAY']
+            if self.session_id:
+                headers.insert(0, f'Session: {self.session_id}')
+            await self._response(*headers)
+            return
+
+        if option in {'GET_PARAMETER', 'SET_PARAMETER'}:
+            # Treat parameter round-trips as RTSP keepalive requests.
+            headers = ['Content-Length: 0']
+            if self.session_id:
+                headers.insert(0, f'Session: {self.session_id}')
+            await self._response(*headers)
+            return
 
         if option == 'DESCRIBE':
             sdp = self._get_description()
