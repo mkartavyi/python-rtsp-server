@@ -1,8 +1,10 @@
 import asyncio
+import base64
+import binascii
 import re
 import time
 from hashlib import md5
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from _config import Config
 from log import Log
@@ -452,7 +454,8 @@ def _get_description(reply):
 
         res = re.match(r'.+?\nm=video .+?\na=fmtp:([^\r\n]+)', sdp, re.DOTALL)
         if res:
-            details['video']['format'] = res.group(1)
+            fmtp = res.group(1)
+            details['video']['format'] = _normalize_fmtp(fmtp)
 
     res = re.match(r'.+?\nm=audio (.+?)\r\n', sdp, re.DOTALL)
     if res:
@@ -518,3 +521,129 @@ def _get_rtp_info(reply):
         raise RuntimeError('Invalid RTP-Info')
 
     return {'seq': seq, 'rtptime': rtptime, 'starttime': time.time()}
+
+
+_ALLOWED_LEVEL_IDC = {
+    0x0A, 0x0B, 0x0C, 0x0D,
+    0x14, 0x15, 0x16,
+    0x1E,
+    0x28, 0x29, 0x2A,
+    0x32, 0x33, 0x34,
+    0x3C,
+    0x42, 0x4D, 0x4E,
+    0x58, 0x59, 0x5A,
+    0x64
+}
+
+
+def _normalize_fmtp(fmtp: str) -> str:
+    """Ensure profile-level-id is present and RFC compliant for H.264."""
+
+    original = fmtp.strip()
+    payload = ''
+    param_string = original
+
+    match = re.match(r'^(\d+)\s+(.*)$', original)
+    if match:
+        payload = match.group(1)
+        param_string = match.group(2)
+
+    params: List[str] = []
+    profile_index: Optional[int] = None
+    lower_params: List[str] = []
+
+    for token in [segment.strip() for segment in param_string.split(';') if segment.strip()]:
+        lower = token.lower()
+        if lower.startswith('profile-level-id='):
+            value = token.split('=', 1)[1]
+            normalized = _normalize_profile_level_id(value, original)
+            if normalized:
+                params.append(f'profile-level-id={normalized}')
+                lower_params.append('profile-level-id')
+            profile_index = len(params)
+            continue
+
+        params.append(token)
+        lower_params.append(lower)
+
+    if 'profile-level-id' not in lower_params:
+        derived = _profile_level_from_sprop(original)
+        if derived:
+            insert_at = profile_index if profile_index is not None else len(params)
+            params.insert(insert_at, f'profile-level-id={derived}')
+            lower_params.insert(insert_at, 'profile-level-id')
+
+    if payload:
+        if params:
+            return f'{payload} ' + ';'.join(params)
+        return payload
+
+    return ';'.join(params)
+
+
+def _normalize_profile_level_id(value: str, fmtp: str) -> Optional[str]:
+    lowered = value.lower()
+    if re.fullmatch(r'[0-9a-f]{6}', lowered):
+        if _is_valid_level_id(lowered):
+            return lowered
+        sps_profile = _profile_level_from_sprop(fmtp)
+        return sps_profile
+
+    if value.isdigit():
+        candidate = f'{int(value):06x}'
+        if _is_valid_level_id(candidate):
+            return candidate
+        sps_profile = _profile_level_from_sprop(fmtp)
+        return sps_profile
+
+    sps_profile = _profile_level_from_sprop(fmtp)
+    if sps_profile:
+        return sps_profile
+
+    return lowered if re.fullmatch(r'[0-9a-f]{6}', lowered) and _is_valid_level_id(lowered) else None
+
+
+def _is_valid_level_id(profile_level_id: str) -> bool:
+    try:
+        level_idc = int(profile_level_id[4:], 16)
+    except ValueError:
+        return False
+    return level_idc in _ALLOWED_LEVEL_IDC
+
+
+def _profile_level_from_sprop(fmtp: str) -> Optional[str]:
+    match = re.search(r'sprop-parameter-sets=([^;\s]+)', fmtp, flags=re.IGNORECASE)
+    if not match:
+        return None
+
+    sprop = match.group(1)
+    sps_b64 = sprop.split(',')[0]
+    sps_data = _decode_h264_sps(sps_b64)
+    if not sps_data or len(sps_data) < 3:
+        return None
+
+    profile_level = ''.join(f'{byte:02x}' for byte in sps_data[:3])
+    return profile_level if _is_valid_level_id(profile_level) else None
+
+
+_BASE64_RE = re.compile(r'[^0-9A-Za-z+/=_-]')
+
+
+def _decode_h264_sps(value: str) -> Optional[bytes]:
+    cleaned = _BASE64_RE.sub('', value).replace('-', '+').replace('_', '/')
+    if not cleaned:
+        return None
+
+    for trim in range(4):
+        candidate = cleaned[:-trim] if trim else cleaned
+        if not candidate:
+            break
+        padding = (-len(candidate)) % 4
+        if padding:
+            candidate = candidate + ('=' * padding)
+        try:
+            return base64.b64decode(candidate, validate=False)
+        except (binascii.Error, ValueError):
+            continue
+
+    return None
