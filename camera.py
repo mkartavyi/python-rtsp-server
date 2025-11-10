@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import re
 import time
 from hashlib import md5
@@ -452,7 +454,8 @@ def _get_description(reply):
 
         res = re.match(r'.+?\nm=video .+?\na=fmtp:([^\r\n]+)', sdp, re.DOTALL)
         if res:
-            details['video']['format'] = res.group(1)
+            fmtp = res.group(1)
+            details['video']['format'] = _normalize_fmtp(fmtp)
 
     res = re.match(r'.+?\nm=audio (.+?)\r\n', sdp, re.DOTALL)
     if res:
@@ -518,3 +521,76 @@ def _get_rtp_info(reply):
         raise RuntimeError('Invalid RTP-Info')
 
     return {'seq': seq, 'rtptime': rtptime, 'starttime': time.time()}
+
+
+_ALLOWED_LEVEL_IDC = {
+    0x0A, 0x0B, 0x0C, 0x0D,
+    0x14, 0x15, 0x16,
+    0x1E,
+    0x28, 0x29, 0x2A,
+    0x32, 0x33, 0x34,
+    0x3C,
+    0x42, 0x4D, 0x4E,
+    0x58, 0x59, 0x5A,
+    0x64
+}
+
+
+def _normalize_fmtp(fmtp: str) -> str:
+    """Ensure profile-level-id is a valid 6-digit hex string."""
+
+    def repl(match: re.Match) -> str:
+        value = match.group(1)
+        normalized = _normalize_profile_level_id(value, fmtp)
+        return f'profile-level-id={normalized}' if normalized else match.group(0)
+
+    return re.sub(r'profile-level-id=([^;\s]+)', repl, fmtp, flags=re.IGNORECASE)
+
+
+def _normalize_profile_level_id(value: str, fmtp: str) -> Optional[str]:
+    lowered = value.lower()
+    if re.fullmatch(r'[0-9a-f]{6}', lowered):
+        if _is_valid_level_id(lowered):
+            return lowered
+        sps_profile = _profile_level_from_sprop(fmtp)
+        return sps_profile or lowered
+
+    if value.isdigit():
+        candidate = f'{int(value):06x}'
+        if _is_valid_level_id(candidate):
+            return candidate
+        sps_profile = _profile_level_from_sprop(fmtp)
+        return sps_profile or candidate
+
+    sps_profile = _profile_level_from_sprop(fmtp)
+    if sps_profile:
+        return sps_profile
+
+    return lowered if re.fullmatch(r'[0-9a-f]{6}', lowered) else None
+
+
+def _is_valid_level_id(profile_level_id: str) -> bool:
+    try:
+        level_idc = int(profile_level_id[4:], 16)
+    except ValueError:
+        return False
+    return level_idc in _ALLOWED_LEVEL_IDC
+
+
+def _profile_level_from_sprop(fmtp: str) -> Optional[str]:
+    match = re.search(r'sprop-parameter-sets=([^;\s]+)', fmtp, flags=re.IGNORECASE)
+    if not match:
+        return None
+
+    sprop = match.group(1)
+    sps_b64 = sprop.split(',')[0]
+    try:
+        padding = '=' * (-len(sps_b64) % 4)
+        sps_data = base64.b64decode(sps_b64 + padding)
+    except (binascii.Error, ValueError):
+        return None
+
+    if len(sps_data) < 3:
+        return None
+
+    return ''.join(f'{byte:02x}' for byte in sps_data[:3])
