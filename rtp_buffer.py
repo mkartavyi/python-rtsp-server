@@ -31,6 +31,13 @@ class RTPPacketBuffer:
             start_index = self._buffer[0][0] if self._buffer else self._next_index
             return RTPPacketReader(self, start_index)
 
+    async def reset(self) -> None:
+        async with self._condition:
+            if self._closed:
+                return
+            self._buffer.clear()
+            self._condition.notify_all()
+
     async def close(self) -> None:
         async with self._condition:
             self._closed = True

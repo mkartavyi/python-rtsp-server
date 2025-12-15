@@ -210,6 +210,13 @@ class Client:
         self.cseq = _get_cseq(ask)
         self.user_agent = _get_user_agent(ask)
 
+        if not camera_path:
+            # Many RTSP clients send an initial OPTIONS without specifying a stream.
+            if not self.camera_hash and option in {'OPTIONS', 'GET_PARAMETER', 'SET_PARAMETER'}:
+                self._content_base = self._build_content_base(parsed_uri)
+                return option
+            camera_path = self.camera_hash or ''
+
         if not self.camera_hash:
             camera_hash = unquote(camera_path)
             if camera_hash not in Shared.data:

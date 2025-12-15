@@ -34,6 +34,15 @@ class Camera:
         self._playing = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._buffer_size = getattr(Config, 'rtp_buffer_size', 256)
+        self._keepalive_task: Optional[asyncio.Task] = None
+        self._watchdog_task: Optional[asyncio.Task] = None
+        self._last_activity = time.monotonic()
+        self._auto_restart = False
+        self._restart_lock = asyncio.Lock()
+        self._preserve_buffers = False
+        self._keepalive_interval = getattr(Config, 'camera_keepalive_interval', 25)
+        self._watchdog_timeout = getattr(Config, 'camera_watchdog_timeout', 20)
+        self._reconnect_delay = getattr(Config, 'camera_reconnect_delay', 3)
 
     async def connect(self):
         """Open TCP socket and connect to the camera."""
@@ -90,7 +99,7 @@ class Camera:
 
             Log.write(f'Camera: connected [{self.hash}]')
 
-    async def play(self):
+    async def play(self, reuse_buffers: bool = False):
         """Start playing and push the stream to the shared RTP buffers."""
         if not self._connected:
             raise RuntimeError(f'Camera {self.hash} is not connected')
@@ -99,6 +108,7 @@ class Camera:
             if self._playing:
                 return
 
+            reuse_buffers = reuse_buffers and bool(self.buffers)
             cmd = (
                 'PLAY',
                 self.url['url'],
@@ -108,25 +118,44 @@ class Camera:
             if Config.tcp_mode:
                 reply, _code = await self._request(*cmd)
                 self.rtp_info = _get_rtp_info(reply)
-                self.buffers['tcp'] = RTPPacketBuffer(self._buffer_size)
+                if 'tcp' not in self.buffers or not reuse_buffers:
+                    self.buffers['tcp'] = RTPPacketBuffer(self._buffer_size)
+                else:
+                    await self.buffers['tcp'].reset()
                 self._loop = asyncio.get_running_loop()
                 self._interleave_task = asyncio.create_task(self._interleave())
             else:
                 reply, _code = await self._request(*cmd)
                 self.rtp_info = _get_rtp_info(reply)
                 self._loop = asyncio.get_running_loop()
-                self.buffers[0] = RTPPacketBuffer(self._buffer_size)
+                if 0 not in self.buffers or not reuse_buffers:
+                    self.buffers[0] = RTPPacketBuffer(self._buffer_size)
+                else:
+                    await self.buffers[0].reset()
                 await self._start_udp_server(0)
 
                 if self.description['audio']:
-                    self.buffers[1] = RTPPacketBuffer(self._buffer_size)
+                    if 1 not in self.buffers or not reuse_buffers:
+                        self.buffers[1] = RTPPacketBuffer(self._buffer_size)
+                    else:
+                        await self.buffers[1].reset()
                     await self._start_udp_server(1)
 
             self._playing = True
+            self._auto_restart = True
+            self._last_activity = time.monotonic()
+            self._start_maintenance_tasks()
 
-    async def close(self):
+    async def close(self, preserve_buffers: bool = False, *, restarting: bool = False):
         """Close all opened sockets, transports, and buffers."""
         self._playing = False
+        if not restarting:
+            self._auto_restart = False
+        if preserve_buffers:
+            self._preserve_buffers = True
+
+        await self._cancel_task('_keepalive_task')
+        await self._cancel_task('_watchdog_task')
 
         if self._interleave_task:
             self._interleave_task.cancel()
@@ -152,15 +181,25 @@ class Camera:
                 pass
         self.udp_transports.clear()
 
-        await self._close_buffers()
+        if preserve_buffers:
+            for buffer in list(self.buffers.values()):
+                try:
+                    await buffer.reset()
+                except Exception:
+                    pass
+            self._preserve_buffers = False
+        else:
+            await self._close_buffers()
+            self.buffers = {}
+            self._preserve_buffers = False
 
         self.reader = None
         self.writer = None
         self._connected = False
         self._loop = None
-        self.buffers = {}
         self.rtp_info = None
         self.transport_params = {}
+        self.session_id = None
 
         Log.write(f'Camera: closed [{self.hash}]')
 
@@ -197,6 +236,7 @@ class Camera:
         buffer = self.buffers.get(idx)
         if not buffer:
             return
+        self._mark_activity()
         loop = self._loop
         if loop is None:
             try:
@@ -241,16 +281,25 @@ class Camera:
                 length = int.from_bytes(length_bytes, 'big')
                 payload = await self.reader.readexactly(length)
 
+                self._mark_activity()
                 packet = b''.join((prefix, channel, length_bytes, payload))
                 await buffer.append(packet)
         except asyncio.IncompleteReadError:
             Log.print(f'Camera: interleaved stream ended unexpectedly [{self.hash}]')
+            await self._handle_stream_failure('interleaved stream ended')
         except asyncio.CancelledError:
             raise
         except Exception as e:
             Log.print(f'Camera: error while reading interleaved data [{self.hash}]: {e}')
+            await self._handle_stream_failure('interleaved read error')
         finally:
-            await buffer.close()
+            if self._preserve_buffers:
+                try:
+                    await buffer.reset()
+                except Exception:
+                    pass
+            else:
+                await buffer.close()
 
     async def _request(self, option, url, *lines):
         """Ask the camera option with given lines. Returns reply and status code."""
@@ -293,6 +342,7 @@ class Camera:
                 packet = b''.join((prefix, channel, length_bytes, payload))
                 buffer = self.buffers.get('tcp')
                 if buffer:
+                    self._mark_activity()
                     await buffer.append(packet)
                 continue
 
@@ -389,6 +439,105 @@ class Camera:
                 await buffer.close()
             except Exception:
                 pass
+
+    def _start_maintenance_tasks(self) -> None:
+        if self._keepalive_interval > 0:
+            self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+        if self._watchdog_timeout > 0:
+            self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
+    async def _cancel_task(self, attr: str) -> None:
+        task = getattr(self, attr, None)
+        if not task:
+            return
+        current = asyncio.current_task()
+        if task is current:
+            setattr(self, attr, None)
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            Log.print(f'Camera: error stopping task {attr} [{self.hash}]: {e}')
+        setattr(self, attr, None)
+
+    async def _keepalive_loop(self) -> None:
+        try:
+            while self._playing and self.session_id:
+                await asyncio.sleep(max(self._keepalive_interval, 1))
+                if not self._playing:
+                    break
+                if not await self._send_keepalive():
+                    await self._handle_stream_failure('keepalive failed')
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            Log.print(f'Camera: keepalive error [{self.hash}]: {e}')
+            await self._handle_stream_failure('keepalive error')
+
+    async def _send_keepalive(self) -> bool:
+        if not self._connected or not self.session_id:
+            return False
+        try:
+            reply, code = await self._request(
+                'OPTIONS',
+                self.url['url'],
+                f'Session: {self.session_id}')
+        except Exception as e:
+            Log.print(f'Camera: keepalive request failed [{self.hash}]: {e}')
+            return False
+        if reply is None or code in {0, 454} or code >= 400:
+            return False
+        return True
+
+    async def _watchdog_loop(self) -> None:
+        try:
+            timeout = max(self._watchdog_timeout, 1)
+            while self._playing:
+                await asyncio.sleep(timeout)
+                if not self._playing:
+                    break
+                if time.monotonic() - self._last_activity > timeout:
+                    await self._handle_stream_failure('rtp watchdog timeout')
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            Log.print(f'Camera: watchdog error [{self.hash}]: {e}')
+            await self._handle_stream_failure('watchdog error')
+
+    async def _handle_stream_failure(self, reason: str) -> None:
+        if not self._auto_restart:
+            return
+        Log.print(f'Camera: warning: stream failure "{reason}" [{self.hash}]')
+        await self._restart(reason)
+
+    async def _restart(self, reason: str) -> None:
+        async with self._restart_lock:
+            if not self._auto_restart:
+                return
+
+            Log.write(f'Camera: restarting [{self.hash}] ({reason})')
+            await self.close(preserve_buffers=True, restarting=True)
+
+            attempt = 0
+            while self._auto_restart:
+                try:
+                    await self.connect()
+                    await self.play(reuse_buffers=True)
+                    Log.write(f'Camera: restart complete [{self.hash}]')
+                    return
+                except Exception as e:
+                    attempt += 1
+                    delay = min(self._reconnect_delay * attempt, 30)
+                    Log.print(f'Camera: restart attempt {attempt} failed [{self.hash}]: {e}')
+                    await asyncio.sleep(delay)
+
+    def _mark_activity(self) -> None:
+        self._last_activity = time.monotonic()
 
 
 class CameraUdpProtocol(asyncio.DatagramProtocol):
